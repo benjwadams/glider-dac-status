@@ -21,7 +21,7 @@ def get_trajectory(erddap_url):
     # list.  The time variable will be removed before converting to GeoJSON
 
     valid_response = False
-    for qc_append in ("qartod_location_flag,", ""):
+    for qc_append in ("qartod_location_test_flag,", ""):
         url_append = url + f"?longitude,latitude,{qc_append}time&orderBy(%22time%22)"
         try:
             response = requests.get(url_append, timeout=180, allow_redirects=True)
@@ -41,7 +41,7 @@ def get_trajectory(erddap_url):
         'type': 'LineString',
         'coordinates': [c[0:2] for c in data['table']['rows']],
         'flag': ([c[2:3] for c in data['table']['rows']]
-                 if "qartod_location_flag" in data['table']['columnNames'] else None)
+                 if "qartod_location_test_flag" in data['table']['columnNames'] else None)
     }
 
     geometry = parse_geometry(geo_data, geo_data['flag'] is not None)
