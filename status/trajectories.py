@@ -6,20 +6,34 @@ import os
 import sys
 from app import app
 from shapely.geometry import LineString
+import shapely.geometry as sgeom
+import cartopy.io.shapereader as shpreader
 from status.profile_plots import iter_deployments, is_recent_data, is_recent_update
 from requests.exceptions import RequestException
+import numpy as np
+from datetime import datetime
 
+
+# Load higher-resolution land polygons for better accuracy
+land_shp = shpreader.natural_earth(resolution='10m', category='physical', name='land')
+land_geom = list(shpreader.Reader(land_shp).geometries())
 
 def get_trajectory(erddap_url):
     '''
-    Reads the trajectory information from ERDDAP and returns a GEOJSON like
-    structure.
+    Reads the trajectory information from ERDDAP and returns a GEOJSON-like
+    structure. Filters by min_time from deployment date.
     '''
+    # Example URL:
     # https://gliders.ioos.us/erddap/tabledap/ru01-20140104T1621.json?latitude,longitude&time&orderBy(%22time%22)
-    url = erddap_url.replace('html', 'json')
-    # ERDDAP requires the variable being sorted to be present in the variable
-    # list.  The time variable will be removed before converting to GeoJSON
 
+    # get deployment time (e.g., 20250611T0000)
+    min_time = erddap_url.split("/")[-1].replace(".html", "").split("-")[-1]
+
+    # fix url with json extension
+    url = erddap_url.replace("html", "json")
+
+    # ERDDAP requires the variable being sorted to be present in the variable
+    # list. The time variable will be removed before converting to GeoJSON
     valid_response = False
     for qc_append in ("qartod_location_test_flag,", ""):
         url_append = url + f"?longitude,latitude,{qc_append}time&orderBy(%22time%22)"
@@ -34,24 +48,39 @@ def get_trajectory(erddap_url):
             break
 
     if not valid_response:
-        raise IOError("Failed to fetch trajectories: {}".format(url_append))
+        raise IOError(f"Failed to fetch trajectories: {url_append}")
 
     data = response.json()
+
+    # Map rows into lon/lat/time/flag
+    col_names = data["table"]["columnNames"]
+    rows = data["table"]["rows"]
+
+    # Identify column indices dynamically
+    lon_idx = col_names.index("longitude")
+    lat_idx = col_names.index("latitude")
+    time_idx = col_names.index("time")
+    flag_idx = col_names.index("qartod_location_test_flag") if "qartod_location_test_flag" in col_names else None
+
     geo_data = {
-        'type': 'LineString',
-        'coordinates': [c[0:2] for c in data['table']['rows']],
-        'flag': ([c[2:3] for c in data['table']['rows']]
-                 if "qartod_location_test_flag" in data['table']['columnNames'] else None)
+        "type": "LineString",
+        "coordinates": [(r[lon_idx], r[lat_idx]) for r in rows],
+        "time": [r[time_idx] for r in rows],
+        "flag": [r[flag_idx] for r in rows] if flag_idx is not None else None,
     }
 
-    geometry = parse_geometry(geo_data, geo_data['flag'] is not None)
-    coords = LineString(geometry['coordinates'])
+    # Call your parse function with min_time filter
+    geometry = parse_geometry_with_checks(geo_data, geo_data["flag"] is not None, min_time)
+
+    # Simplify trajectory
+    coords = LineString(geometry["coordinates"])
     trajectory = coords.simplify(0.02, preserve_topology=False)
+
     geometry = {
-        'type': 'LineString',
-        'coordinates': list(trajectory.coords),
-        'properties': {
-            'oceansmap_type': 'glider'
+        "type": "LineString",
+        "coordinates": list(trajectory.coords),
+        "properties": {
+            "oceansmap_type": "glider",
         }
     }
     return geometry
@@ -85,28 +114,61 @@ def write_trajectory(deployment, geo_data):
         f.write(json.dumps(geo_data))
 
 
-def parse_geometry(geometry: dict, has_flag: bool):
-    '''
-    Filters out potentially bad coordinate pairs as returned from
-    GliderDAC if location flags exist. Returns a safe geometry object.
-
-    :param dict geometry: A GeoJSON Geometry object
-    :param bool has_flag: Whether of not location flags exist in this dataset
-    '''
+def parse_geometry_with_checks(geometry: dict, has_flag: bool, min_time: str = None):
+    """
+    Filters out bad coordinate pairs based on:
+      - minimum time threshold (if provided),
+      - flags,
+      - land masking,
+      - outlier detection.
+    
+    Returns geometry with only 'coordinates'.
+    """
+    
     coords = []
-    if not has_flag:
-        for lon, lat in geometry['coordinates']:
-            if lon is None or lat is None:
-                continue
-            coords.append([lon, lat])
-    else:
-        for (lon, lat), flag in zip(geometry['coordinates'], geometry['flag']):
-            if (flag[0] is not None and flag[0] != 1 or
-                lon is None or lat is None):
-                continue
-            coords.append([lon, lat])
+    times = geometry.get("time")
 
+    # --- Step 0: Time filtering ---
+    if min_time and times:
+        min_dt = datetime.strptime(min_time, "%Y%m%dT%H%M")
+        filtered = [((lon, lat), t) for (lon, lat), t in zip(geometry['coordinates'], times)
+                    if datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ") >= min_dt]
+        filtered_coords = [lonlat for lonlat, _ in filtered]
+    else:
+        filtered_coords = geometry['coordinates']
+
+    # --- Step 1: Filter by flags and missing values ---
+    if has_flag:
+        filtered_coords = [
+            (lon, lat) for (lon, lat), flag in zip(filtered_coords, geometry['flag'])
+            if (flag is None or flag == 1) and lon is not None and lat is not None
+        ]
+    else:
+        filtered_coords = [(lon, lat) for lon, lat in filtered_coords
+                           if lon is not None and lat is not None]
+ 
+    # --- Step 2: Remove points that fall on land ---
+    sea_coords = [(lon, lat) for lon, lat in filtered_coords if not is_on_land(lon, lat)]
+    
+    # --- Step 3: Remove statistical outliers ---
+    if sea_coords:
+        lons = np.array([lon for lon, _ in sea_coords])
+        lats = np.array([lat for _, lat in sea_coords])
+
+        z_lon = np.abs((lons - lons.mean()) / lons.std())
+        z_lat = np.abs((lats - lats.mean()) / lats.std())
+
+        threshold = 3
+        coords = [(lon, lat) for (lon, lat), zl, zt in zip(sea_coords, z_lon, z_lat)
+                  if zl <= threshold and zt <= threshold]
+    
     return {'coordinates': coords}
+
+
+def is_on_land(lon, lat):
+    """Check if coordinate is on land using shapely polygons."""
+    point = sgeom.Point(lon, lat)
+    return any(poly.contains(point) for poly in land_geom)
 
 
 def trajectory_exists(deployment):
