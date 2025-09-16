@@ -9,7 +9,7 @@ RUN yarn global add grunt-cli && \
     yarn install && \
     grunt
 
-FROM python:3.6
+FROM python:3.12
 ARG glider_gid_uid=1000
 
 RUN mkdir -p /glider-dac-status /mpl_config
