@@ -4,6 +4,8 @@ from flask import jsonify, Flask
 from datetime import datetime, timezone, timedelta
 import json
 from contextlib import contextmanager
+from status.trajectories import exclude_trajectory_path_from_landmass
+import numpy as np
 
 @app.route('/api/deployments')
 def deployments_mock():
@@ -87,3 +89,17 @@ def _generate_status_json(data_type="api_return"):
 
 
     return status_dict
+
+def test_exclude_trajectory_path_from_landmass():
+    """Test that glider track vertices over landmasses get properly excluded"""
+    los_angeles_point = (-118.2437, 34.0522)  # Los Angeles, CA
+    fake_traj = [
+        (-160.0, 25.0),        # Somewhere in the central Pacific Ocean
+        (-150.0, 28.0),        # A waypoint farther east
+        (-140.0, 30.0),        # Approaching the eastern Pacific
+        (-130.0, 32.0),        # Off the California coast
+        los_angeles_point,
+    ]
+    traj_filtered = exclude_trajectory_path_from_landmass(fake_traj)
+    assert (np.size(traj_filtered, 0) < len(fake_traj) and
+            los_angeles_point not in traj_filtered.tolist())
