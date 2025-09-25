@@ -11,6 +11,7 @@ from status.profile_plots import iter_deployments, is_recent_data, is_recent_upd
 from requests.exceptions import RequestException
 import numpy as np
 from datetime import datetime
+from typing import List, Tuple
 
 import os
 os.environ["CARTOPY_USER_BACKGROUNDS"] = "/tmp/cartopy"
